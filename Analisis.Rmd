@@ -1,0 +1,163 @@
+---
+title: "Analisis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warnings = FALSE)
+```
+
+```{r}
+library(soes)
+data(posts)
+data(votes)
+```
+
+```{r}
+library(dplyr)
+
+respuestas <- posts %>%
+  inner_join(posts, by=c("ParentId"="Id"), suffix=c(".respuesta", ".pregunta")) %>%
+  select(IdRespuesta = Id,
+         IdPregunta = ParentId,
+         Puntaje = Score.respuesta,
+         Creacion = CreationDate.respuesta,
+         Tags = Tags.pregunta)
+```
+
+```{r}
+library(tidytext)
+respuestas_tag <- respuestas %>%
+  unnest_tokens(Tag, Tags, token="regex", pattern="[<> ]", drop=FALSE)
+
+tags <- respuestas_tag %>%
+  group_by(Tag) %>%
+  summarise(PuntajeTotal = sum(Puntaje),
+          Respuestas = n(),
+          PuntajeMediana = median(Puntaje),
+          PuntajePromedio = mean(Puntaje)) %>%
+  ungroup()
+```
+
+```{r}
+library(ggplot2)
+
+tags %>%
+  arrange(-PuntajeTotal) %>%
+  head(n=10) %>%
+  mutate(Tag = reorder(Tag, PuntajeTotal)) %>%
+  ggplot(aes(Tag, PuntajeTotal)) +
+    geom_col() +
+    coord_flip()
+```
+
+```{r}
+tags %>%
+  filter(Respuestas > 100) %>%
+  arrange(-PuntajePromedio) %>%
+  head(n=10) %>%
+
+  mutate(Tag = reorder(Tag, PuntajePromedio)) %>%
+  ggplot(aes(Tag, PuntajePromedio)) +
+    geom_col() +
+    coord_flip()
+```
+
+```{r}
+top_tags <- tags %>%
+  filter(Respuestas > 100) %>%
+  arrange(-PuntajePromedio) %>%
+  head(n=10)
+
+respuestas_tag %>%
+  inner_join(top_tags) %>%
+  mutate(Tag = reorder(Tag, PuntajeMediana)) %>%
+  ggplot(aes(Tag, Puntaje)) +
+  coord_flip() +
+  geom_boxplot()
+
+respuestas_tag %>%
+  filter(Creacion >= '2016-03-01') %>%
+  inner_join(top_tags) %>%
+  mutate(Tag = reorder(Tag, PuntajeMediana)) %>%
+  ggplot(aes(Tag, Puntaje)) +
+  coord_flip() +
+  geom_boxplot()
+```
+
+```{r}
+votos_por_respuesta_por_mes <- votes %>%
+  filter(VoteTypeId == 2) %>%
+  inner_join(respuestas_tag, by=c("PostId"="IdRespuesta")) %>%
+  mutate(Mes=as.Date(format(CreationDate, "%Y-%m-01"))) %>%
+  group_by(Mes) %>%
+  summarize(VotosPorRespuesta = n() / length(unique(PostId)),
+            Respuestas = n()) %>%
+  ungroup()
+
+library(plotly)
+grafico <- votos_por_respuesta_por_mes %>%
+  ggplot(aes(Mes, VotosPorRespuesta)) +
+  expand_limits(y = c(0, 10)) +
+  geom_line()
+
+ggplotly(grafico)
+```
+
+Hasta acá llegué en la demo... este es un bonus track :) hago un modelo de machine learning para entender cómo la "edad" de la pregunta (en días) y las distintas tags contribuyen al puntaje.
+
+```{r}
+ultima_respuesta <- respuestas_tag %>%
+  arrange(-IdRespuesta) %>%
+  head(n=1)
+ultimo_dia = ultima_respuesta$Creacion
+
+library(broom)
+library(tidyr)
+todas_mis_variables <- respuestas_tag %>%
+  # Agrego la edad en días (la quiero usar para predecir el puntaje)
+  mutate(EdadEnDias = difftime(ultimo_dia, Creacion, units = c("days"))) %>%
+
+  # Me quedo con las columnas que quiero
+  select(IdRespuesta, EdadEnDias, Puntaje, Tag) %>%
+    
+  # Creo una columna que siempre tenga 1... esto lo necesito para el próximo paso... para poder hacer una regresión logísitca, necesito tener una fila por observación, con todas las variables explicativas en las columnas. Como cada tag es potencialmente una variable explicativa, las necesito a todas como columnas
+  mutate(Existe=1) %>%
+  
+  # Convierte un montón de filas a en una fila sola con un montón de columnas
+  spread(Tag, Existe, fill=0) %>%
+  
+  # El IdRespuesta no es una variable explicativa... o sea, no quiero que el modelo intente "predecir" cómo el id de una respuesta afecta su puntaje
+  select(-IdRespuesta)
+```
+
+```{r}
+# este es el modelo! en 2 líneas
+modelo <- lm(formula = Puntaje ~ ., # Quiero predecir el puntaje usando todas las columnas,
+                                    # por eso es ~ ., si quisiera predecirla sólo por la edad, sería
+                                    # formula = Puntaje ~ Edad
+             
+             data = todas_mis_variables)
+```
+
+```{r}
+# trabajar con el modelo directo es medio complicado, es un objeto y no podemos usar pipes para filtrar
+# lo que queremos... esta función genera un dataframe a partir del modelo
+tidy(modelo) %>%
+  filter(term != '(Intercept)') %>% # saco el intercept (no ayuda a explicar los resultados)
+  filter(p.value < 0.005) %>%       # saco los valores no relevantes
+  arrange(-estimate)                # los ordeno de forma descendente
+```
+
+Y listo! Esto lo podemos interpretar de la siguiente forma:
+
+* EdadEnDias tiene un coeficiente de 0.002927006. Esto quiere decir que cada día que pasa, las respuestas suman 0.002927006 votos (o, cada 1000 días, suman 2 votos)
+* El hecho de que una respuesta sea sobre código-abierto, le agrega 13 puntos! hay sólo una pregunta con la etiqueta, tiene 4 respuestas y todas tienen por lo menos 13 votos. Tiene sentido, aunque no me ayuda a la hora de planear mi estrategia
+* De las tags que vimos, una interesante parecía ser regex. Tiene un coeficiente de 1.45, así que pinta interesante! por responder de regex, podemos esperar por lo menos tener un voto
+* git tiene un coeficiente de 1.2
+
+En fin... hay muchas cosas para verificar, y seguramente me haya mandado algunas... macanas, pero quería mostrar cómo en R, se puede hacer una regresión lineal y qué tipo de conclusiones se pueden sacar.
+
+**DISCLAIMER**: Como dije en la presentación, no soy data scientist. Me falta mucha estadística para poder hacer un análisis riguroso de los datos. En este modelo, hay muchas variables colineares (javascript y jquery por ejemplo). Identificarlas y eliminarlas complicaría bastante el código y la idea no es hacer un análisis para un paper... sino mostrar que es una herramienta en la que uno puede hacer un análisis basado en el conocimiento del producto y se puede pasar a un data scientist para que haga su magia.
+
+Tenés comentarios? Hacé un issue y la seguimos por ahí :) o mencioname en twitter!
